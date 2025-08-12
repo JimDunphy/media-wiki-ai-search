@@ -1,0 +1,296 @@
+# %%% NOT TESTED - do not run unless prepared to debug them
+
+---
+- name: Deploy Streamlit RAG app on Oracle Linux 9
+  hosts: ragapp
+  become: true
+  vars:
+    # ==== Customize these ====
+    app_user: ragapp
+    app_group: ragapp
+    app_dir: /opt/ragapp
+    app_repo: "https://github.com/yourorg/yourrepo.git"   # or set to "" if copying manually
+    app_branch: "main"
+    app_entrypoint: "rag_app_v2.py"
+    venv_dir: "{{ app_dir }}/.venv"
+
+    # Streamlit server settings
+    app_host: "127.0.0.1"
+    app_port: 8501
+    base_url_path: ""           # set "rag" for subpath; leave "" for root
+
+    # Environment for your app (NO SECRETS IN GIT)
+    env_file: /etc/default/ragapp
+    env_vars:
+      OPENAI_API_KEY: "REPLACE_ME"
+      DB_PATH: "{{ app_dir }}/data/lancedb"
+      TABLE_NAME: "wiki_aesir"
+
+    # Nginx / domain
+    use_nginx: true
+    server_name: "example.com"  # your domain
+    use_tls: false              # set true to use certbot via snap
+    email_for_tls: "you@example.com"
+
+    # If you don’t want git clone (e.g., you rsync code in), set app_repo="" and skip --tags code
+  pre_tasks:
+    - name: Ensure base repos + tools (Oracle Linux 9)
+      tags: [packages]
+      ansible.builtin.dnf:
+        name:
+          - git
+          - python3
+          - python3-pip
+          - python3-virtualenv
+          - policycoreutils-python-utils  # for semanage
+          - firewalld
+        state: present
+
+    - name: Ensure firewalld running
+      tags: [firewall]
+      ansible.builtin.service:
+        name: firewalld
+        enabled: true
+        state: started
+
+  tasks:
+    - name: Create app user/group
+      tags: [user]
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: true
+        create_home: false
+
+    - name: Create directories
+      tags: [dirs]
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+      loop:
+        - "{{ app_dir }}"
+        - "/var/log/ragapp"
+
+    - name: Clone app repo (optional)
+      tags: [code]
+      when: app_repo | length > 0
+      ansible.builtin.git:
+        repo: "{{ app_repo }}"
+        version: "{{ app_branch }}"
+        dest: "{{ app_dir }}"
+        force: false
+        update: true
+      register: git_result
+
+    - name: Create Python venv
+      tags: [venv]
+      ansible.builtin.command:
+        cmd: "python3 -m venv {{ venv_dir }}"
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Install requirements if present
+      tags: [deps]
+      ansible.builtin.shell: |
+        set -e
+        source "{{ venv_dir }}/bin/activate"
+        if [ -f requirements.txt ]; then
+          pip install --upgrade pip
+          pip install -r requirements.txt
+        else
+          # fall back to explicit packages if needed:
+          pip install --upgrade pip
+          pip install streamlit
+        fi
+      args:
+        chdir: "{{ app_dir }}"
+        executable: /bin/bash
+      become_user: "{{ app_user }}"
+
+    - name: Write environment file (no secrets in git!)
+      tags: [env]
+      ansible.builtin.copy:
+        dest: "{{ env_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          {% for k, v in env_vars.items() %}
+          {{ k }}={{ v }}
+          {% endfor %}
+          HOST={{ app_host }}
+          PORT={{ app_port }}
+          BASE_URL_PATH={{ base_url_path }}
+
+    - name: Create systemd service
+      tags: [systemd]
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ragapp.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=RAG Streamlit App
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ env_file }}
+          ExecStart={{ venv_dir }}/bin/streamlit run {{ app_entrypoint }} \
+            --server.address ${HOST} \
+            --server.port ${PORT} \
+            --server.headless true{% if base_url_path|length > 0 %} \
+            --server.baseUrlPath ${BASE_URL_PATH}{% endif %}
+          Restart=always
+          RestartSec=3
+          NoNewPrivileges=yes
+          PrivateTmp=yes
+          ProtectHome=yes
+          ProtectSystem=full
+          StandardOutput=append:/var/log/ragapp/app.log
+          StandardError=append:/var/log/ragapp/app.err
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: [reload systemd]
+
+    - name: Start & enable service
+      tags: [start]
+      ansible.builtin.service:
+        name: ragapp
+        state: started
+        enabled: true
+
+    - name: Open HTTP/HTTPS in firewall (for Nginx)
+      tags: [firewall]
+      when: use_nginx
+      ansible.posix.firewalld:
+        service: "{{ item }}"
+        permanent: true
+        immediate: true
+        state: enabled
+      loop:
+        - http
+        - https
+
+    - name: Install Nginx
+      tags: [nginx]
+      when: use_nginx
+      ansible.builtin.dnf:
+        name: nginx
+        state: present
+
+    - name: Nginx config (root path)
+      tags: [nginx]
+      when: use_nginx and (base_url_path | length == 0)
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/ragapp.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              server_name {{ server_name }};
+
+              location / {
+                  proxy_pass http://{{ app_host }}:{{ app_port }};
+                  proxy_set_header Host $host;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 3600;
+                  proxy_send_timeout 3600;
+              }
+          }
+      notify: [reload nginx]
+
+    - name: Nginx config (subpath)
+      tags: [nginx, subpath]
+      when: use_nginx and (base_url_path | length > 0)
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/ragapp.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              server_name {{ server_name }};
+
+              location /{{ base_url_path }}/ {
+                  proxy_pass http://{{ app_host }}:{{ app_port }}/{{ base_url_path }}/;
+                  proxy_set_header Host $host;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 3600;
+                  proxy_send_timeout 3600;
+              }
+          }
+      notify: [reload nginx]
+
+    - name: SELinux — allow Nginx to proxy (if needed)
+      tags: [selinux]
+      when: use_nginx
+      ansible.builtin.command: setsebool -P httpd_can_network_connect 1
+
+    # TLS via certbot (snap is the easiest path on OL9)
+    - name: Install snapd
+      tags: [tls]
+      when: use_nginx and use_tls
+      ansible.builtin.dnf:
+        name: snapd
+        state: present
+
+    - name: Enable snapd socket
+      tags: [tls]
+      when: use_nginx and use_tls
+      ansible.builtin.service:
+        name: snapd.socket
+        enabled: true
+        state: started
+
+    - name: Link classic snap (core)
+      tags: [tls]
+      when: use_nginx and use_tls
+      ansible.builtin.shell: "ln -s /var/lib/snapd/snap /snap || true"
+
+    - name: Install certbot via snap
+      tags: [tls]
+      when: use_nginx and use_tls
+      ansible.builtin.command: snap install --classic certbot
+
+    - name: Symlink certbot
+      tags: [tls]
+      when: use_nginx and use_tls
+      ansible.builtin.file:
+        src: /snap/bin/certbot
+        dest: /usr/bin/certbot
+        state: link
+        force: true
+
+    - name: Obtain/Install cert (nginx)
+      tags: [tls]
+      when: use_nginx and use_tls
+      ansible.builtin.command: >
+        certbot --nginx -d {{ server_name }}
+        --non-interactive --agree-tos -m {{ email_for_tls }}
+      notify: [reload nginx]
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.command: systemctl daemon-reload
+
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+
