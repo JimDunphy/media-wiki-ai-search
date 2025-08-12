@@ -1,0 +1,6 @@
+# env files
+.env
+.env.*      # e.g., .env.local, .env.development
+*.env
+env.txt
+
